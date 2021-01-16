@@ -196,7 +196,7 @@ pub mod formats {
 
 /// Resampler with preallocated buffers and coeffecients for the given
 /// dimensions and filter type.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Resizer<Format: PixelFormat> {
     scale: Scale,
     pix_fmt: Format,
@@ -204,7 +204,7 @@ pub struct Resizer<Format: PixelFormat> {
     tmp: Vec<Format::Accumulator>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Scale {
     /// Source dimensions.
     w1: usize,
