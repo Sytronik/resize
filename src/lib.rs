@@ -3,37 +3,42 @@
 //! # Examples
 //!
 //! ```
-//! use resize::Pixel::RGB24;
+//! use resize::Pixel::RGB8;
 //! use resize::Type::Lanczos3;
 //! use rgb::RGB8;
+//! use rgb::FromSlice;
 //!
 //! // Downscale by 2x.
 //! let (w1, h1) = (640, 480);
 //! let (w2, h2) = (320, 240);
-//! // Don't forget to fill `src` with image data (RGB24).
+//! // Don't forget to fill `src` with image data (RGB8).
 //! let src = vec![0;w1*h1*3];
 //! // Destination buffer. Must be mutable.
 //! let mut dst = vec![0;w2*h2*3];
 //! // Create reusable instance.
-//! let mut resizer = resize::new(w1, h1, w2, h2, RGB24, Lanczos3);
+//! let mut resizer = resize::new(w1, h1, w2, h2, RGB8, Lanczos3)?;
 //! // Do resize without heap allocations.
 //! // Might be executed multiple times for different `src` or `dst`.
-//! resizer.resize(&src, &mut dst);
+//! resizer.resize(src.as_rgb(), dst.as_rgb_mut());
+//! # Ok::<_, resize::Error>(())
 //! ```
 // Current implementation is based on:
 // * https://github.com/sekrit-twc/zimg/tree/master/src/zimg/resize
 // * https://github.com/PistonDevelopers/image/blob/master/src/imageops/sample.rs
 #![deny(missing_docs)]
 
+use fallible_collections::FallibleVec;
 use std::sync::Arc;
-use std::collections::HashMap;
+use fallible_collections::TryHashMap;
 use std::f32;
+use std::fmt;
+use std::num::NonZeroUsize;
 
-mod px;
-#[allow(deprecated)]
-use px::PixelFormatBackCompatShim;
+/// See [Error]
+pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-#[doc(hidden)]
+/// Pixel format from the [rgb] crate.
+pub mod px;
 pub use px::PixelFormat;
 
 /// Resizing type to use.
@@ -148,6 +153,7 @@ pub mod Pixel {
     use crate::formats;
 
     /// Grayscale, 8-bit.
+    #[cfg_attr(docsrs, doc(alias = "Grey"))]
     pub const Gray8: formats::Gray<u8, u8> = formats::Gray(PhantomData);
     /// Grayscale, 16-bit, native endian.
     pub const Gray16: formats::Gray<u16, u16> = formats::Gray(PhantomData);
@@ -158,13 +164,31 @@ pub mod Pixel {
     pub const GrayF64: formats::Gray<f64, f64> = formats::Gray(PhantomData);
 
     /// RGB, 8-bit per component.
-    pub const RGB24: formats::Rgb<u8, u8> = formats::Rgb(PhantomData);
+    #[cfg_attr(docsrs, doc(alias = "RGB24"))]
+    pub const RGB8: formats::Rgb<u8, u8> = formats::Rgb(PhantomData);
     /// RGB, 16-bit per component, native endian.
-    pub const RGB48: formats::Rgb<u16, u16> = formats::Rgb(PhantomData);
-    /// RGBA, 8-bit per component.
-    pub const RGBA: formats::Rgba<u8, u8> = formats::Rgba(PhantomData);
-    /// RGBA, 16-bit per component, native endian.
-    pub const RGBA64: formats::Rgba<u16, u16> = formats::Rgba(PhantomData);
+    #[cfg_attr(docsrs, doc(alias = "RGB48"))]
+    pub const RGB16: formats::Rgb<u16, u16> = formats::Rgb(PhantomData);
+    /// RGBA, 8-bit per component. Components are scaled independently. Use this if the input is already alpha-premultiplied.
+    ///
+    /// Preserves RGB values of fully-transparent pixels. Expect halos around edges of transparency if using regular, uncorrelated RGBA. See [RGBA8P].
+    #[cfg_attr(docsrs, doc(alias = "RGBA32"))]
+    pub const RGBA8: formats::Rgba<u8, u8> = formats::Rgba(PhantomData);
+    /// RGBA, 16-bit per component, native endian. Components are scaled independently. Use this if the input is already alpha-premultiplied.
+    ///
+    /// Preserves RGB values of fully-transparent pixels. Expect halos around edges of transparency if using regular, uncorrelated RGBA. See [RGBA16P].
+    #[cfg_attr(docsrs, doc(alias = "RGBA64"))]
+    pub const RGBA16: formats::Rgba<u16, u16> = formats::Rgba(PhantomData);
+    /// RGBA, 8-bit per component. RGB components will be converted to premultiplied during scaling, and then converted back to uncorrelated.
+    ///
+    /// Clears "dirty alpha". Use this for high-quality scaling of regular uncorrelated (not premultiplied) RGBA bitmaps.
+    #[cfg_attr(docsrs, doc(alias = "premultiplied"))]
+    #[cfg_attr(docsrs, doc(alias = "prem"))]
+    pub const RGBA8P: formats::RgbaPremultiply<u8, u8> = formats::RgbaPremultiply(PhantomData);
+    /// RGBA, 16-bit per component, native endian. RGB components will be converted to premultiplied during scaling, and then converted back to uncorrelated.
+    ///
+    /// Clears "dirty alpha". Use this for high-quality scaling of regular uncorrelated (not premultiplied) RGBA bitmaps.
+    pub const RGBA16P: formats::RgbaPremultiply<u16, u16> = formats::RgbaPremultiply(PhantomData);
 
     /// RGB, 32-bit float per component. This is pretty efficient, since resizing uses f32 internally.
     pub const RGBF32: formats::Rgb<f32, f32> = formats::Rgb(PhantomData);
@@ -172,8 +196,12 @@ pub mod Pixel {
     pub const RGBF64: formats::Rgb<f64, f64> = formats::Rgb(PhantomData);
 
     /// RGBA, 32-bit float per component. This is pretty efficient, since resizing uses f32 internally.
+    ///
+    /// Components are scaled independently (no premultiplication applied)
     pub const RGBAF32: formats::Rgba<f32, f32> = formats::Rgba(PhantomData);
     /// RGBA, 64-bit double per component.
+    ///
+    /// Components are scaled independently (no premultiplication applied)
     pub const RGBAF64: formats::Rgba<f64, f64> = formats::Rgba(PhantomData);
 }
 
@@ -186,9 +214,12 @@ pub mod formats {
     /// RGB pixels
     #[derive(Debug, Copy, Clone)]
     pub struct Rgb<InputSubpixel, OutputSubpixel>(pub(crate) PhantomData<(InputSubpixel, OutputSubpixel)>);
-    /// RGBA pixels
+    /// RGBA pixels, each channel is independent. Compatible with premultiplied input/output.
     #[derive(Debug, Copy, Clone)]
     pub struct Rgba<InputSubpixel, OutputSubpixel>(pub(crate) PhantomData<(InputSubpixel, OutputSubpixel)>);
+    /// Apply premultiplication to RGBA pixels during scaling. Assumes **non**-premultiplied input/output.
+    #[derive(Debug, Copy, Clone)]
+    pub struct RgbaPremultiply<InputSubpixel, OutputSubpixel>(pub(crate) PhantomData<(InputSubpixel, OutputSubpixel)>);
     /// Grayscale pixels
     #[derive(Debug, Copy, Clone)]
     pub struct Gray<InputSubpixel, OutputSubpixel>(pub(crate) PhantomData<(InputSubpixel, OutputSubpixel)>);
@@ -207,8 +238,8 @@ pub struct Resizer<Format: PixelFormat> {
 #[derive(Debug, Clone)]
 struct Scale {
     /// Source dimensions.
-    w1: usize,
-    h1: usize,
+    w1: NonZeroUsize,
+    h1: NonZeroUsize,
     /// Vec's len == target dimensions
     coeffs_w: Vec<CoeffsLine>,
     coeffs_h: Vec<CoeffsLine>,
@@ -235,7 +266,12 @@ struct CoeffsLine {
 type DynCallback<'a> = &'a dyn Fn(f32) -> f32;
 
 impl Scale {
-    pub fn new(source_width: usize, source_heigth: usize, dest_width: usize, dest_height: usize, filter_type: Type) -> Self {
+    pub fn new(source_width: usize, source_heigth: usize, dest_width: usize, dest_height: usize, filter_type: Type) -> Result<Self> {
+        let source_width = NonZeroUsize::new(source_width).ok_or(Error::InvalidParameters)?;
+        let source_heigth = NonZeroUsize::new(source_heigth).ok_or(Error::InvalidParameters)?;
+        if dest_width == 0 || dest_height == 0 {
+            return Err(Error::InvalidParameters);
+        }
         let filter = match filter_type {
             Type::Point => (&point_kernel as DynCallback, 0.0_f32),
             Type::Triangle => (&triangle_kernel as DynCallback, 1.0),
@@ -248,65 +284,69 @@ impl Scale {
         // filters very often create repeating patterns,
         // so overall memory used by them can be reduced
         // which should save some cache space
-        let mut recycled_coeffs = HashMap::new();
+        let mut recycled_coeffs = TryHashMap::with_capacity(dest_width.max(dest_height))?;
 
-        let coeffs_w = Self::calc_coeffs(source_width, dest_width, filter, &mut recycled_coeffs);
+        let coeffs_w = Self::calc_coeffs(source_width, dest_width, filter, &mut recycled_coeffs)?;
         let coeffs_h = if source_heigth == source_width && dest_height == dest_width {
             coeffs_w.clone()
         } else {
-            Self::calc_coeffs(source_heigth, dest_height, filter, &mut recycled_coeffs)
+            Self::calc_coeffs(source_heigth, dest_height, filter, &mut recycled_coeffs)?
         };
 
-        Self {
+        Ok(Self {
             w1: source_width,
             h1: source_heigth,
             coeffs_w,
             coeffs_h,
-        }
+        })
     }
 
-    fn calc_coeffs(s1: usize, s2: usize, (kernel, support): (&dyn Fn(f32) -> f32, f32), recycled_coeffs: &mut HashMap<(usize, [u8; 4], [u8; 4]), Arc<[f32]>>) -> Vec<CoeffsLine> {
-        let ratio = s1 as f64 / s2 as f64;
+    fn calc_coeffs(s1: NonZeroUsize, s2: usize, (kernel, support): (&dyn Fn(f32) -> f32, f32), recycled_coeffs: &mut TryHashMap<(usize, [u8; 4], [u8; 4]), Arc<[f32]>>) -> Result<Vec<CoeffsLine>> {
+        let ratio = s1.get() as f64 / s2 as f64;
         // Scale the filter when downsampling.
         let filter_scale = ratio.max(1.);
         let filter_radius = (support as f64 * filter_scale).ceil();
-        (0..s2).map(|x2| {
+        let mut res = Vec::try_with_capacity(s2)?;
+        for x2 in 0..s2 {
             let x1 = (x2 as f64 + 0.5) * ratio - 0.5;
             let start = (x1 - filter_radius).ceil() as isize;
-            let start = start.min(s1 as isize - 1).max(0) as usize;
+            let start = start.min(s1.get() as isize - 1).max(0) as usize;
             let end = (x1 + filter_radius).floor() as isize;
-            let end = (end.min(s1 as isize - 1).max(0) as usize).max(start);
+            let end = (end.min(s1.get() as isize - 1).max(0) as usize).max(start);
             let sum: f64 = (start..=end).map(|i| (kernel)(((i as f64 - x1) / filter_scale) as f32) as f64).sum();
             let key = (end - start, (filter_scale as f32).to_ne_bytes(), (start as f32 - x1 as f32).to_ne_bytes());
-            let coeffs = recycled_coeffs.entry(key).or_insert_with(|| {
-                (start..=end).map(|i| {
+            let coeffs = if let Some(k) = recycled_coeffs.get(&key) { k.clone() } else {
+                let tmp = (start..=end).map(|i| {
                     let n = ((i as f64 - x1) / filter_scale) as f32;
                     ((kernel)(n.min(support).max(-support)) as f64 / sum) as f32
-                }).collect::<Arc<[_]>>()
-            }).clone();
-            CoeffsLine { start, coeffs }
-        }).collect()
+                }).collect::<Arc<[_]>>();
+                recycled_coeffs.insert(key, tmp.clone())?;
+                tmp
+            };
+            res.push(CoeffsLine { start, coeffs });
+        }
+        Ok(res)
     }
 }
 
 impl<Format: PixelFormat> Resizer<Format> {
     /// Create a new resizer instance.
     #[inline]
-    pub fn new(source_width: usize, source_heigth: usize, dest_width: usize, dest_height: usize, pixel_format: Format, filter_type: Type) -> Self {
-        Self {
-            scale: Scale::new(source_width, source_heigth, dest_width, dest_height, filter_type),
+    pub fn new(source_width: usize, source_heigth: usize, dest_width: usize, dest_height: usize, pixel_format: Format, filter_type: Type) -> Result<Self> {
+        Ok(Self {
+            scale: Scale::new(source_width, source_heigth, dest_width, dest_height, filter_type)?,
             tmp: Vec::new(),
             pix_fmt: pixel_format,
-        }
+        })
     }
 
     /// Stride is a length of the source row (>= W1)
-    fn resample_both_axes(&mut self, src: &[Format::InputPixel], stride: usize, mut dst: &mut [Format::OutputPixel]) {
+    fn resample_both_axes(&mut self, src: &[Format::InputPixel], stride: NonZeroUsize, mut dst: &mut [Format::OutputPixel]) -> Result<()> {
         self.tmp.clear();
-        self.tmp.reserve(self.scale.w2() * self.scale.h1);
+        FallibleVec::try_reserve(&mut self.tmp, self.scale.w2() * self.scale.h1.get())?;
 
         // Outer loop resamples W2xH1 to W2xH2
-        let mut src_rows = src.chunks(stride);
+        let mut src_rows = src.chunks(stride.get());
         for row in &self.scale.coeffs_h {
             let w2 = self.scale.w2();
 
@@ -336,40 +376,42 @@ impl<Format: PixelFormat> Resizer<Format> {
             }
             dst = &mut dst[w2..];
         }
+        Ok(())
     }
 
     /// Resize `src` image data into `dst`.
     #[inline]
-    pub(crate) fn resize_internal(&mut self, src: &[Format::InputPixel], src_stride: usize, dst: &mut [Format::OutputPixel]) {
+    pub(crate) fn resize_internal(&mut self, src: &[Format::InputPixel], src_stride: NonZeroUsize, dst: &mut [Format::OutputPixel]) -> Result<()> {
         // TODO(Kagami):
         // * Multi-thread
-        // * Bound checkings
         // * SIMD
-        assert!(self.scale.w1 <= src_stride, "width must be smaller than stride");
-        assert!(src.len() >= (src_stride * self.scale.h1) + self.scale.w1 - src_stride, "source length must be larger than area");
-        assert_eq!(dst.len(), self.scale.w2() * self.scale.h2(), "destination slice must be exactly {}x{}", self.scale.w2(), self.scale.h2());
-        self.resample_both_axes(src, src_stride, dst);
+        if self.scale.w1.get() > src_stride.get() ||
+            src.len() < (src_stride.get() * self.scale.h1.get()) + self.scale.w1.get() - src_stride.get() ||
+            dst.len() != self.scale.w2() * self.scale.h2() {
+                return Err(Error::InvalidParameters)
+            }
+        self.resample_both_axes(src, src_stride, dst)
     }
 }
 
-#[allow(deprecated)]
-impl<Format: PixelFormatBackCompatShim> Resizer<Format> {
+impl<Format: PixelFormat> Resizer<Format> {
     /// Resize `src` image data into `dst`.
     #[inline]
-    pub fn resize(&mut self, src: &[Format::Subpixel], dst: &mut [Format::Subpixel]) {
-        self.resize_internal(Format::input(src), self.scale.w1, Format::output(dst))
+    pub fn resize(&mut self, src: &[Format::InputPixel], dst: &mut [Format::OutputPixel]) -> Result<()> {
+        self.resize_internal(src, self.scale.w1, dst)
     }
 
     /// Resize `src` image data into `dst`, skipping `stride` pixels each row.
     #[inline]
-    pub fn resize_stride(&mut self, src: &[Format::Subpixel], src_stride: usize, dst: &mut [Format::Subpixel]) {
-        self.resize_internal(Format::input(src), src_stride, Format::output(dst))
+    pub fn resize_stride(&mut self, src: &[Format::InputPixel], src_stride: usize, dst: &mut [Format::OutputPixel]) -> Result<()> {
+        let src_stride = NonZeroUsize::new(src_stride).ok_or(Error::InvalidParameters)?;
+        self.resize_internal(src, src_stride, dst)
     }
 }
 
 /// Create a new resizer instance. Alias for `Resizer::new`.
 #[inline(always)]
-pub fn new<Format: PixelFormat>(src_width: usize, src_height: usize, dest_width: usize, dest_height: usize, pixel_format: Format, filter_type: Type) -> Resizer<Format> {
+pub fn new<Format: PixelFormat>(src_width: usize, src_height: usize, dest_width: usize, dest_height: usize, pixel_format: Format, filter_type: Type) -> Result<Resizer<Format>> {
     Resizer::new(src_width, src_height, dest_width, dest_height, pixel_format, filter_type)
 }
 
@@ -381,32 +423,116 @@ pub fn new<Format: PixelFormat>(src_width: usize, src_height: usize, dest_width:
 /// consider creating an resizer instance since it's faster.
 #[deprecated(note="Use resize::new().resize()")]
 #[allow(deprecated)]
-pub fn resize<Format: PixelFormatBackCompatShim>(
+pub fn resize<Format: PixelFormat>(
     src_width: usize, src_height: usize, dest_width: usize, dest_height: usize,
     pixel_format: Format, filter_type: Type,
-    src: &[Format::Subpixel], dst: &mut [Format::Subpixel],
-) {
-    Resizer::<Format>::new(src_width, src_height, dest_width, dest_height, pixel_format, filter_type).resize(src, dst)
+    src: &[Format::InputPixel], dst: &mut [Format::OutputPixel],
+) -> Result<()> {
+    Resizer::<Format>::new(src_width, src_height, dest_width, dest_height, pixel_format, filter_type)?.resize(src, dst)
+}
+
+/// Resizing may run out of memory
+#[derive(Debug)]
+pub enum Error {
+    /// Allocation failed
+    OutOfMemory,
+    /// e.g. width or height can't be 0
+    InvalidParameters,
+}
+
+impl std::error::Error for Error {}
+
+impl From<fallible_collections::TryReserveError> for Error {
+    #[inline(always)]
+    fn from(_: fallible_collections::TryReserveError) -> Self {
+        Self::OutOfMemory
+    }
+}
+
+impl fmt::Display for Error {
+    #[cold]
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(match self {
+            Self::OutOfMemory => "out of memory",
+            Self::InvalidParameters => "invalid parameters"
+        })
+    }
+}
+
+#[test]
+fn oom() {
+    let _ = new(2, 2, isize::max_value() as _, isize::max_value() as _, Pixel::Gray16, Type::Triangle);
+}
+
+#[test]
+fn niche() {
+    assert_eq!(std::mem::size_of::<Resizer<formats::Gray<f32, f32>>>(), std::mem::size_of::<Option<Resizer<formats::Gray<f32, f32>>>>());
+}
+
+#[test]
+fn zeros() {
+    assert!(new(1, 1, 1, 0, Pixel::Gray16, Type::Triangle).is_err());
+    assert!(new(1, 1, 0, 1, Pixel::Gray8, Type::Catrom).is_err());
+    assert!(new(1, 0, 1, 1, Pixel::RGBAF32, Type::Lanczos3).is_err());
+    assert!(new(0, 1, 1, 1, Pixel::RGB8, Type::Mitchell).is_err());
+}
+
+#[test]
+fn premultiply() {
+    use px::RGBA;
+    let mut r = new(2, 2, 3, 4, Pixel::RGBA8P, Type::Triangle).unwrap();
+    let mut dst = vec![RGBA::new(0u8,0,0,0u8); 12];
+    r.resize(&[
+        RGBA::new(255,127,3,255), RGBA::new(0,0,0,0),
+        RGBA::new(255,255,255,0), RGBA::new(0,255,255,0),
+    ], &mut dst).unwrap();
+    assert_eq!(&dst, &[
+        RGBA { r: 255, g: 127, b: 3, a: 255 }, RGBA { r: 255, g: 127, b: 3, a: 128 }, RGBA { r: 0, g: 0, b: 0, a: 0 },
+        RGBA { r: 255, g: 127, b: 3, a: 191 }, RGBA { r: 255, g: 127, b: 3, a: 96 }, RGBA { r: 0, g: 0, b: 0, a: 0 },
+        RGBA { r: 255, g: 127, b: 3, a: 64 }, RGBA { r: 255, g: 127, b: 3, a: 32 }, RGBA { r: 0, g: 0, b: 0, a: 0 },
+        RGBA { r: 0, g: 0, b: 0, a: 0 }, RGBA { r: 0, g: 0, b: 0, a: 0 }, RGBA { r: 0, g: 0, b: 0, a: 0 }
+    ]);
+}
+
+#[test]
+fn premultiply_solid() {
+    use px::RGBA;
+    let mut r = new(2, 2, 3, 4, Pixel::RGBA8P, Type::Triangle).unwrap();
+    let mut dst = vec![RGBA::new(0u8,0,0,0u8); 12];
+    r.resize(&[
+        RGBA::new(255,255,255,255), RGBA::new(0,0,0,255),
+        RGBA::new(0,0,0,255), RGBA::new(0,0,0,255),
+    ], &mut dst).unwrap();
+    assert_eq!(&dst, &[
+        RGBA { r: 255, g: 255, b: 255, a: 255 }, RGBA { r: 128, g: 128, b: 128, a: 255 }, RGBA { r: 0, g: 0, b: 0, a: 255 },
+        RGBA { r: 191, g: 191, b: 191, a: 255 }, RGBA { r: 96, g: 96, b: 96, a: 255 }, RGBA { r: 0, g: 0, b: 0, a: 255 },
+        RGBA { r: 64, g: 64, b: 64, a: 255 }, RGBA { r: 32, g: 32, b: 32, a: 255 }, RGBA { r: 0, g: 0, b: 0, a: 255 },
+        RGBA { r: 0, g: 0, b: 0, a: 255 }, RGBA { r: 0, g: 0, b: 0, a: 255 }, RGBA { r: 0, g: 0, b: 0, a: 255 },
+    ]);
 }
 
 #[test]
 fn resize_stride() {
-    let mut r = new(2, 2, 3, 4, Pixel::Gray16, Type::Triangle);
+    use rgb::FromSlice;
+
+    let mut r = new(2, 2, 3, 4, Pixel::Gray16, Type::Triangle).unwrap();
     let mut dst = vec![0; 12];
     r.resize_stride(&[
         65535,65535,1,2,
         65535,65535,3,4,
-    ], 4, &mut dst);
+    ].as_gray(), 4, dst.as_gray_mut()).unwrap();
     assert_eq!(&dst, &[65535; 12]);
 }
 
 #[test]
 fn resize_float() {
-    let mut r = new(2, 2, 3, 4, Pixel::GrayF32, Type::Triangle);
+    use rgb::FromSlice;
+
+    let mut r = new(2, 2, 3, 4, Pixel::GrayF32, Type::Triangle).unwrap();
     let mut dst = vec![0.; 12];
     r.resize_stride(&[
         65535.,65535.,1.,2.,
         65535.,65535.,3.,4.,
-    ], 4, &mut dst);
+    ].as_gray(), 4, dst.as_gray_mut()).unwrap();
     assert_eq!(&dst, &[65535.; 12]);
 }
