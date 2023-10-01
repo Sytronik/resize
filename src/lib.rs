@@ -26,20 +26,39 @@
 // * https://github.com/sekrit-twc/zimg/tree/master/src/zimg/resize
 // * https://github.com/PistonDevelopers/image/blob/master/src/imageops/sample.rs
 #![deny(missing_docs)]
+#![cfg_attr(all(feature = "no_std", not(feature = "std")), no_std)]
 
-use fallible_collections::FallibleVec;
-use std::sync::Arc;
-use fallible_collections::TryHashMap;
-use std::f32;
-use std::fmt;
-use std::num::NonZeroUsize;
+extern crate alloc;
+
+use core::f32;
+use core::fmt;
+use core::num::NonZeroUsize;
+
+use alloc::boxed::Box;
+use alloc::collections::TryReserveError;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+
+#[cfg(all(feature = "no_std", not(feature = "std")))]
+use hashbrown::HashMap;
+#[cfg(not(all(feature = "no_std", not(feature = "std"))))]
+use std::collections::HashMap;
+
+#[cfg(feature = "rayon")]
+use rayon::prelude::*;
 
 /// See [Error]
-pub type Result<T, E = Error> = std::result::Result<T, E>;
+pub type Result<T, E = Error> = core::result::Result<T, E>;
 
 /// Pixel format from the [rgb] crate.
 pub mod px;
 pub use px::PixelFormat;
+
+#[cfg(all(feature = "no_std", not(feature = "std")))]
+mod no_std_float;
+#[cfg(all(feature = "no_std", not(feature = "std")))]
+#[allow(unused_imports)]
+use no_std_float::FloatExt;
 
 /// Resizing type to use.
 pub enum Type {
@@ -149,8 +168,8 @@ fn lanczos(taps: f32, x: f32) -> f32 {
 #[allow(non_snake_case)]
 #[allow(non_upper_case_globals)]
 pub mod Pixel {
-    use std::marker::PhantomData;
     use crate::formats;
+    use core::marker::PhantomData;
 
     /// Grayscale, 8-bit.
     #[cfg_attr(docsrs, doc(alias = "Grey"))]
@@ -210,7 +229,7 @@ pub mod Pixel {
 /// These structs implement `PixelFormat` trait that allows conversion to and from internal pixel representation.
 #[doc(hidden)]
 pub mod formats {
-    use std::marker::PhantomData;
+    use core::marker::PhantomData;
     /// RGB pixels
     #[derive(Debug, Copy, Clone)]
     pub struct Rgb<InputSubpixel, OutputSubpixel>(pub(crate) PhantomData<(InputSubpixel, OutputSubpixel)>);
@@ -284,7 +303,8 @@ impl Scale {
         // filters very often create repeating patterns,
         // so overall memory used by them can be reduced
         // which should save some cache space
-        let mut recycled_coeffs = TryHashMap::with_capacity(dest_width.max(dest_height))?;
+        let mut recycled_coeffs = HashMap::new();
+        recycled_coeffs.try_reserve(dest_width.max(dest_height))?;
 
         let coeffs_w = Self::calc_coeffs(source_width, dest_width, filter, &mut recycled_coeffs)?;
         let coeffs_h = if source_heigth == source_width && dest_height == dest_width {
@@ -301,12 +321,13 @@ impl Scale {
         })
     }
 
-    fn calc_coeffs(s1: NonZeroUsize, s2: usize, (kernel, support): (&dyn Fn(f32) -> f32, f32), recycled_coeffs: &mut TryHashMap<(usize, [u8; 4], [u8; 4]), Arc<[f32]>>) -> Result<Vec<CoeffsLine>> {
+    fn calc_coeffs(s1: NonZeroUsize, s2: usize, (kernel, support): (&dyn Fn(f32) -> f32, f32), recycled_coeffs: &mut HashMap<(usize, [u8; 4], [u8; 4]), Arc<[f32]>>) -> Result<Vec<CoeffsLine>> {
         let ratio = s1.get() as f64 / s2 as f64;
         // Scale the filter when downsampling.
         let filter_scale = ratio.max(1.);
         let filter_radius = (support as f64 * filter_scale).ceil();
-        let mut res = Vec::try_with_capacity(s2)?;
+        let mut res = Vec::new();
+        res.try_reserve_exact(s2)?;
         for x2 in 0..s2 {
             let x1 = (x2 as f64 + 0.5) * ratio - 0.5;
             let start = (x1 - filter_radius).ceil() as isize;
@@ -320,7 +341,8 @@ impl Scale {
                     let n = ((i as f64 - x1) / filter_scale) as f32;
                     ((kernel)(n.min(support).max(-support)) as f64 / sum) as f32
                 }).collect::<Arc<[_]>>();
-                recycled_coeffs.insert(key, tmp.clone())?;
+                recycled_coeffs.try_reserve(1)?;
+                recycled_coeffs.insert(key, tmp.clone());
                 tmp
             };
             res.push(CoeffsLine { start, coeffs });
@@ -341,24 +363,34 @@ impl<Format: PixelFormat> Resizer<Format> {
     }
 
     /// Stride is a length of the source row (>= W1)
-    fn resample_both_axes(&mut self, src: &[Format::InputPixel], stride: NonZeroUsize, mut dst: &mut [Format::OutputPixel]) -> Result<()> {
+    #[cfg(not(feature = "rayon"))]
+    fn resample_both_axes(&mut self, src: &[Format::InputPixel], stride: NonZeroUsize, dst: &mut [Format::OutputPixel]) -> Result<()> {
+        let w2 = self.scale.w2();
+
+        // eliminate panic in step_by
+        if w2 == 0 {
+            return Err(Error::InvalidParameters);
+        }
+
         self.tmp.clear();
-        FallibleVec::try_reserve(&mut self.tmp, self.scale.w2() * self.scale.h1.get())?;
+        self.tmp.try_reserve_exact(w2 * self.scale.h1.get())?;
 
         // Outer loop resamples W2xH1 to W2xH2
         let mut src_rows = src.chunks(stride.get());
-        for row in &self.scale.coeffs_h {
-            let w2 = self.scale.w2();
+        for (dst, row) in dst.chunks_exact_mut(w2).zip(&self.scale.coeffs_h) {
 
             // Inner loop resamples W1xH1 to W2xH1,
             // but only as many rows as necessary to write a new line
             // to the output
-            while self.tmp.len() < w2 * (row.start + row.coeffs.len()) {
+            let end = w2 * (row.start + row.coeffs.len());
+            while self.tmp.len() < end {
                 let row = src_rows.next().unwrap();
                 let pix_fmt = &self.pix_fmt;
                 self.tmp.extend(self.scale.coeffs_w.iter().map(|col| {
+                    // it won't fail, but get avoids panic code bloat
+                    let in_px = row.get(col.start..col.start + col.coeffs.len()).unwrap_or_default();
+
                     let mut accum = Format::new();
-                    let in_px = &row[col.start..col.start + col.coeffs.len()];
                     for (coeff, in_px) in col.coeffs.iter().copied().zip(in_px.iter().copied()) {
                         pix_fmt.add(&mut accum, in_px, coeff)
                     }
@@ -366,25 +398,94 @@ impl<Format: PixelFormat> Resizer<Format> {
                 }));
             }
 
-            let tmp_rows = &self.tmp[w2 * row.start..];
-            for (col, dst_px) in dst[0..w2].iter_mut().enumerate() {
+            let tmp_row_start = &self.tmp.get(w2 * row.start..).unwrap_or_default();
+            for (col, dst_px) in dst.iter_mut().enumerate() {
                 let mut accum = Format::new();
-                for (coeff, other_row) in row.coeffs.iter().copied().zip(tmp_rows.chunks_exact(w2)) {
-                    Format::add_acc(&mut accum, other_row[col], coeff);
+                for (coeff, other_row) in row.coeffs.iter().copied().zip(tmp_row_start.iter().copied().skip(col).step_by(w2)) {
+                    Format::add_acc(&mut accum, other_row, coeff);
                 }
                 *dst_px = self.pix_fmt.into_pixel(accum);
             }
-            dst = &mut dst[w2..];
         }
+        Ok(())
+    }
+
+    #[cfg(feature = "rayon")]
+    fn resample_both_axes(&mut self, mut src: &[Format::InputPixel], stride: NonZeroUsize, dst: &mut [Format::OutputPixel]) -> Result<()> {
+        let stride = stride.get();
+        let pix_fmt = &self.pix_fmt;
+        let w2 = self.scale.w2();
+        let h2 = self.scale.h2();
+        let w1 = self.scale.w1.get();
+        let h1 = self.scale.h1.get();
+
+        // Ensure the destination buffer has adequate size for the resampling operation.
+        if w2 == 0 || h2 == 0 || dst.len() < w2 * h2 || src.len() < (stride * h1) + w1 - stride {
+            return Err(Error::InvalidParameters);
+        }
+
+        // ensure it doesn't have too many rows
+        if src.len() > stride * h1 {
+            src = &src[..stride * h1];
+        }
+
+        // Prepare the temporary buffer for intermediate storage.
+        self.tmp.clear();
+        let tmp_area = w2 * h1;
+        self.tmp.try_reserve_exact(tmp_area)?;
+
+        debug_assert_eq!(w2, self.scale.coeffs_w.len());
+
+        // in tiny images spawning of tasks takes longer than single-threaded resizing
+        // constant/area is for small images. h1.max(w2) for wide images. h1/256 for tall images.
+        let work_chunk = ((1<<14) / (w2 * h1.max(w2))).max(h1/256);
+
+        // Horizontal Resampling
+        // Process each row in parallel. Each pixel within a row is processed sequentially.
+        src.par_chunks(stride).with_min_len(work_chunk).zip(self.tmp.spare_capacity_mut().par_chunks_exact_mut(self.scale.coeffs_w.len())).for_each(|(row, tmp)| {
+            // For each pixel in the row, calculate the horizontal resampling and store the result.
+            self.scale.coeffs_w.iter().zip(tmp).for_each(move |(col, tmp)| {
+                // this get won't fail, but it generates less code than panicking []
+                let in_px = row.get(col.start..col.start + col.coeffs.len()).unwrap_or_default();
+
+                let mut accum = Format::new();
+                for (coeff, in_px) in col.coeffs.iter().copied().zip(in_px.iter().copied()) {
+                    pix_fmt.add(&mut accum, in_px, coeff);
+                }
+
+                // Write the accumulated value to the temporary buffer.
+                tmp.write(accum);
+            });
+        });
+
+        // already checked that src had right number lines for the loop to write all
+        unsafe { self.tmp.set_len(tmp_area); }
+
+        let tmp_slice = self.tmp.as_slice();
+
+        // Vertical Resampling
+        // Process each row in parallel. Each pixel within a row is processed sequentially.
+        dst.par_chunks_exact_mut(w2).with_min_len(((1<<14) / (w2 * h2.max(w2))).max(h2/256)).zip(self.scale.coeffs_h.par_iter()).for_each(move |(dst, row)| {
+            // Determine the start of the current row in the temporary buffer.
+            let tmp_row_start = &tmp_slice.get(w2 * row.start..).unwrap_or_default();
+            // For each pixel in the row, calculate the vertical resampling and store the result directly into the destination buffer.
+            dst.iter_mut().enumerate().for_each(move |(x, dst)| {
+                let mut accum = Format::new();
+                for (coeff, other_pixel) in row.coeffs.iter().copied().zip(tmp_row_start.iter().copied().skip(x).step_by(w2)) {
+                    Format::add_acc(&mut accum, other_pixel, coeff);
+                }
+
+                // Write the accumulated value to the destination buffer.
+                *dst = pix_fmt.into_pixel(accum);
+            });
+        });
+
         Ok(())
     }
 
     /// Resize `src` image data into `dst`.
     #[inline]
     pub(crate) fn resize_internal(&mut self, src: &[Format::InputPixel], src_stride: NonZeroUsize, dst: &mut [Format::OutputPixel]) -> Result<()> {
-        // TODO(Kagami):
-        // * Multi-thread
-        // * SIMD
         if self.scale.w1.get() > src_stride.get() ||
             src.len() < (src_stride.get() * self.scale.h1.get()) + self.scale.w1.get() - src_stride.get() ||
             dst.len() != self.scale.w2() * self.scale.h2() {
@@ -440,11 +541,20 @@ pub enum Error {
     InvalidParameters,
 }
 
+#[cfg(feature = "std")]
 impl std::error::Error for Error {}
 
-impl From<fallible_collections::TryReserveError> for Error {
+impl From<TryReserveError> for Error {
     #[inline(always)]
-    fn from(_: fallible_collections::TryReserveError) -> Self {
+    fn from(_: TryReserveError) -> Self {
+        Self::OutOfMemory
+    }
+}
+
+#[cfg(all(feature = "no_std", not(feature = "std")))]
+impl From<hashbrown::TryReserveError> for Error {
+    #[inline(always)]
+    fn from(_: hashbrown::TryReserveError) -> Self {
         Self::OutOfMemory
     }
 }
@@ -459,80 +569,85 @@ impl fmt::Display for Error {
     }
 }
 
-#[test]
-fn oom() {
-    let _ = new(2, 2, isize::max_value() as _, isize::max_value() as _, Pixel::Gray16, Type::Triangle);
-}
+#[cfg(all(test, feature = "std"))]
+mod tests {
+    use super::*;
 
-#[test]
-fn niche() {
-    assert_eq!(std::mem::size_of::<Resizer<formats::Gray<f32, f32>>>(), std::mem::size_of::<Option<Resizer<formats::Gray<f32, f32>>>>());
-}
+    #[test]
+    fn oom() {
+        let _ = new(2, 2, isize::max_value() as _, isize::max_value() as _, Pixel::Gray16, Type::Triangle);
+    }
 
-#[test]
-fn zeros() {
-    assert!(new(1, 1, 1, 0, Pixel::Gray16, Type::Triangle).is_err());
-    assert!(new(1, 1, 0, 1, Pixel::Gray8, Type::Catrom).is_err());
-    assert!(new(1, 0, 1, 1, Pixel::RGBAF32, Type::Lanczos3).is_err());
-    assert!(new(0, 1, 1, 1, Pixel::RGB8, Type::Mitchell).is_err());
-}
+    #[test]
+    fn niche() {
+        assert_eq!(std::mem::size_of::<Resizer<formats::Gray<f32, f32>>>(), std::mem::size_of::<Option<Resizer<formats::Gray<f32, f32>>>>());
+    }
 
-#[test]
-fn premultiply() {
-    use px::RGBA;
-    let mut r = new(2, 2, 3, 4, Pixel::RGBA8P, Type::Triangle).unwrap();
-    let mut dst = vec![RGBA::new(0u8,0,0,0u8); 12];
-    r.resize(&[
-        RGBA::new(255,127,3,255), RGBA::new(0,0,0,0),
-        RGBA::new(255,255,255,0), RGBA::new(0,255,255,0),
-    ], &mut dst).unwrap();
-    assert_eq!(&dst, &[
-        RGBA { r: 255, g: 127, b: 3, a: 255 }, RGBA { r: 255, g: 127, b: 3, a: 128 }, RGBA { r: 0, g: 0, b: 0, a: 0 },
-        RGBA { r: 255, g: 127, b: 3, a: 191 }, RGBA { r: 255, g: 127, b: 3, a: 96 }, RGBA { r: 0, g: 0, b: 0, a: 0 },
-        RGBA { r: 255, g: 127, b: 3, a: 64 }, RGBA { r: 255, g: 127, b: 3, a: 32 }, RGBA { r: 0, g: 0, b: 0, a: 0 },
-        RGBA { r: 0, g: 0, b: 0, a: 0 }, RGBA { r: 0, g: 0, b: 0, a: 0 }, RGBA { r: 0, g: 0, b: 0, a: 0 }
-    ]);
-}
+    #[test]
+    fn zeros() {
+        assert!(new(1, 1, 1, 0, Pixel::Gray16, Type::Triangle).is_err());
+        assert!(new(1, 1, 0, 1, Pixel::Gray8, Type::Catrom).is_err());
+        assert!(new(1, 0, 1, 1, Pixel::RGBAF32, Type::Lanczos3).is_err());
+        assert!(new(0, 1, 1, 1, Pixel::RGB8, Type::Mitchell).is_err());
+    }
 
-#[test]
-fn premultiply_solid() {
-    use px::RGBA;
-    let mut r = new(2, 2, 3, 4, Pixel::RGBA8P, Type::Triangle).unwrap();
-    let mut dst = vec![RGBA::new(0u8,0,0,0u8); 12];
-    r.resize(&[
-        RGBA::new(255,255,255,255), RGBA::new(0,0,0,255),
-        RGBA::new(0,0,0,255), RGBA::new(0,0,0,255),
-    ], &mut dst).unwrap();
-    assert_eq!(&dst, &[
-        RGBA { r: 255, g: 255, b: 255, a: 255 }, RGBA { r: 128, g: 128, b: 128, a: 255 }, RGBA { r: 0, g: 0, b: 0, a: 255 },
-        RGBA { r: 191, g: 191, b: 191, a: 255 }, RGBA { r: 96, g: 96, b: 96, a: 255 }, RGBA { r: 0, g: 0, b: 0, a: 255 },
-        RGBA { r: 64, g: 64, b: 64, a: 255 }, RGBA { r: 32, g: 32, b: 32, a: 255 }, RGBA { r: 0, g: 0, b: 0, a: 255 },
-        RGBA { r: 0, g: 0, b: 0, a: 255 }, RGBA { r: 0, g: 0, b: 0, a: 255 }, RGBA { r: 0, g: 0, b: 0, a: 255 },
-    ]);
-}
+    #[test]
+    fn premultiply() {
+        use px::RGBA;
+        let mut r = new(2, 2, 3, 4, Pixel::RGBA8P, Type::Triangle).unwrap();
+        let mut dst = vec![RGBA::new(0u8,0,0,0u8); 12];
+        r.resize(&[
+            RGBA::new(255,127,3,255), RGBA::new(0,0,0,0),
+            RGBA::new(255,255,255,0), RGBA::new(0,255,255,0),
+        ], &mut dst).unwrap();
+        assert_eq!(&dst, &[
+            RGBA { r: 255, g: 127, b: 3, a: 255 }, RGBA { r: 255, g: 127, b: 3, a: 128 }, RGBA { r: 0, g: 0, b: 0, a: 0 },
+            RGBA { r: 255, g: 127, b: 3, a: 191 }, RGBA { r: 255, g: 127, b: 3, a: 96 }, RGBA { r: 0, g: 0, b: 0, a: 0 },
+            RGBA { r: 255, g: 127, b: 3, a: 64 }, RGBA { r: 255, g: 127, b: 3, a: 32 }, RGBA { r: 0, g: 0, b: 0, a: 0 },
+            RGBA { r: 0, g: 0, b: 0, a: 0 }, RGBA { r: 0, g: 0, b: 0, a: 0 }, RGBA { r: 0, g: 0, b: 0, a: 0 }
+        ]);
+    }
 
-#[test]
-fn resize_stride() {
-    use rgb::FromSlice;
+    #[test]
+    fn premultiply_solid() {
+        use px::RGBA;
+        let mut r = new(2, 2, 3, 4, Pixel::RGBA8P, Type::Triangle).unwrap();
+        let mut dst = vec![RGBA::new(0u8,0,0,0u8); 12];
+        r.resize(&[
+            RGBA::new(255,255,255,255), RGBA::new(0,0,0,255),
+            RGBA::new(0,0,0,255), RGBA::new(0,0,0,255),
+        ], &mut dst).unwrap();
+        assert_eq!(&dst, &[
+            RGBA { r: 255, g: 255, b: 255, a: 255 }, RGBA { r: 128, g: 128, b: 128, a: 255 }, RGBA { r: 0, g: 0, b: 0, a: 255 },
+            RGBA { r: 191, g: 191, b: 191, a: 255 }, RGBA { r: 96, g: 96, b: 96, a: 255 }, RGBA { r: 0, g: 0, b: 0, a: 255 },
+            RGBA { r: 64, g: 64, b: 64, a: 255 }, RGBA { r: 32, g: 32, b: 32, a: 255 }, RGBA { r: 0, g: 0, b: 0, a: 255 },
+            RGBA { r: 0, g: 0, b: 0, a: 255 }, RGBA { r: 0, g: 0, b: 0, a: 255 }, RGBA { r: 0, g: 0, b: 0, a: 255 },
+        ]);
+    }
 
-    let mut r = new(2, 2, 3, 4, Pixel::Gray16, Type::Triangle).unwrap();
-    let mut dst = vec![0; 12];
-    r.resize_stride(&[
-        65535,65535,1,2,
-        65535,65535,3,4,
-    ].as_gray(), 4, dst.as_gray_mut()).unwrap();
-    assert_eq!(&dst, &[65535; 12]);
-}
+    #[test]
+    fn resize_stride() {
+        use rgb::FromSlice;
 
-#[test]
-fn resize_float() {
-    use rgb::FromSlice;
+        let mut r = new(2, 2, 3, 4, Pixel::Gray16, Type::Triangle).unwrap();
+        let mut dst = vec![0; 12];
+        r.resize_stride(&[
+            65535,65535,1,2,
+            65535,65535,3,4,
+        ].as_gray(), 4, dst.as_gray_mut()).unwrap();
+        assert_eq!(&dst, &[65535; 12]);
+    }
 
-    let mut r = new(2, 2, 3, 4, Pixel::GrayF32, Type::Triangle).unwrap();
-    let mut dst = vec![0.; 12];
-    r.resize_stride(&[
-        65535.,65535.,1.,2.,
-        65535.,65535.,3.,4.,
-    ].as_gray(), 4, dst.as_gray_mut()).unwrap();
-    assert_eq!(&dst, &[65535.; 12]);
+    #[test]
+    fn resize_float() {
+        use rgb::FromSlice;
+
+        let mut r = new(2, 2, 3, 4, Pixel::GrayF32, Type::Triangle).unwrap();
+        let mut dst = vec![0.; 12];
+        r.resize_stride(&[
+            65535.,65535.,1.,2.,
+            65535.,65535.,3.,4.,
+        ].as_gray(), 4, dst.as_gray_mut()).unwrap();
+        assert_eq!(&dst, &[65535.; 12]);
+    }
 }
